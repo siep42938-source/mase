@@ -4,18 +4,26 @@ const cors    = require('cors')
 const path    = require('path')
 const fs      = require('fs')
 const db      = require('./db')
+const { createServer } = require('http')
+const { Server } = require('socket.io')
 
 const app = express()
 app.use(express.json())
 // В продакшене разрешаем APP_URL, в разработке — localhost
 const allowedOrigins = process.env.NODE_ENV === 'production'
-  ? [process.env.APP_URL].filter(Boolean)
+  ? [
+      process.env.APP_URL,
+      'https://meshenger-black.vercel.app',
+      // Разрешаем все поддомены vercel.app для preview деплоев
+    ].filter(Boolean)
   : ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:5173', 'http://127.0.0.1:5173']
 
 app.use(cors({
   origin: (origin, callback) => {
     // Разрешаем запросы без origin (мобильные PWA, Postman)
     if (!origin) return callback(null, true)
+    // Разрешаем все vercel.app домены (preview деплои)
+    if (origin.endsWith('.vercel.app')) return callback(null, true)
     if (allowedOrigins.includes(origin)) return callback(null, true)
     callback(new Error('CORS: origin not allowed'))
   },
@@ -366,7 +374,7 @@ app.post('/api/verify-otp', (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/api/register', (req, res) => {
   const ip = getIp(req)
-  const { phone, name } = req.body
+  const { phone, name, username } = req.body
   if (!phone || !name?.trim()) return res.status(400).json({ error: 'Укажите phone и name' })
 
   const normalized = '+' + phone.replace(/\D/g, '')
@@ -377,10 +385,11 @@ app.post('/api/register', (req, res) => {
 
   try {
     const user  = db.createUser(normalized, name.trim())
+    // Сохраняем username если передан
+    if (username) db.updateUser(normalized, { username: username.toLowerCase().replace(/[^a-z0-9_]/g, '') })
     const token = db.createSession(user.id, normalized, ip)
-    // Уведомляем тебя о новом пользователе
     tgSend(ADMIN_CHAT_ID, `🎉 НОВЫЙ ПОЛЬЗОВАТЕЛЬ\n\n📱 ${normalized}\n👤 ${name.trim()}\n🌐 IP: ${ip}`)
-    return res.json({ success: true, token, user })
+    return res.json({ success: true, token, user: { ...user, username } })
   } catch (e) {
     return res.status(409).json({ error: e.message })
   }
@@ -466,12 +475,135 @@ app.post('/api/link-telegram', requireAuth, async (req, res) => {
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok' }))
 
+// ─── Search users ─────────────────────────────────────────────────────────────
+app.get('/api/users/search', requireAuth, (req, res) => {
+  const { q } = req.query
+  if (!q || String(q).trim().length < 2) {
+    return res.json({ users: [] })
+  }
+  const results = db.searchUsers(String(q), req.session.phone)
+  res.json({ users: results })
+})
+
 const PORT = process.env.PORT || 3001
-app.listen(PORT, async () => {
+const httpServer = createServer(app)
+const io = new Server(httpServer, {
+  cors: {
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true)
+      if (origin.endsWith('.vercel.app')) return callback(null, true)
+      if (allowedOrigins.includes(origin)) return callback(null, true)
+      callback(new Error('CORS: origin not allowed'))
+    },
+    credentials: true,
+  },
+})
+
+// ─── WebSocket: аутентификация ────────────────────────────────────────────────
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token
+  const session = db.getSession(token)
+  if (!session) return next(new Error('Не авторизован'))
+  socket.userId = session.userId
+  socket.phone = session.phone
+  next()
+})
+
+// ─── WebSocket: обработка подключений ─────────────────────────────────────────
+const userSockets = new Map() // userId -> socket.id
+
+io.on('connection', (socket) => {
+  console.log(`✅ Пользователь подключен: ${socket.phone} (${socket.id})`)
+  userSockets.set(socket.userId, socket.id)
+
+  // Отправить сообщение
+  socket.on('message:send', (data) => {
+    const { chatId, message } = data
+    console.log(`💬 Сообщение от ${socket.phone}: ${message}`)
+    
+    // Сохраняем в БД
+    db.saveMessage(chatId, socket.userId, message)
+    
+    // Отправляем всем в чате
+    io.to(chatId).emit('message:receive', {
+      chatId,
+      userId: socket.userId,
+      phone: socket.phone,
+      message,
+      timestamp: new Date(),
+    })
+  })
+
+  // Присоединиться к чату
+  socket.on('chat:join', (chatId) => {
+    socket.join(chatId)
+    console.log(`👥 ${socket.phone} присоединился к чату ${chatId}`)
+  })
+
+  // Покинуть чат
+  socket.on('chat:leave', (chatId) => {
+    socket.leave(chatId)
+    console.log(`👋 ${socket.phone} покинул чат ${chatId}`)
+  })
+
+  // Статус печати
+  socket.on('user:typing', (data) => {
+    const { chatId } = data
+    socket.to(chatId).emit('user:typing', {
+      userId: socket.userId,
+      phone: socket.phone,
+    })
+  })
+
+  // Входящий звонок
+  socket.on('call:initiate', (data) => {
+    const { recipientId, callData } = data
+    const recipientSocketId = userSockets.get(recipientId)
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('call:incoming', {
+        callerId: socket.userId,
+        callerPhone: socket.phone,
+        callData,
+      })
+    }
+  })
+
+  // Ответить на звонок
+  socket.on('call:answer', (data) => {
+    const { callerId } = data
+    const callerSocketId = userSockets.get(callerId)
+    if (callerSocketId) {
+      io.to(callerSocketId).emit('call:answered', {
+        answerId: socket.userId,
+        answerPhone: socket.phone,
+      })
+    }
+  })
+
+  // Отклонить звонок
+  socket.on('call:reject', (data) => {
+    const { callerId } = data
+    const callerSocketId = userSockets.get(callerId)
+    if (callerSocketId) {
+      io.to(callerSocketId).emit('call:rejected', {
+        rejectId: socket.userId,
+      })
+    }
+  })
+
+  // Отключение
+  socket.on('disconnect', () => {
+    console.log(`❌ Пользователь отключен: ${socket.phone}`)
+    userSockets.delete(socket.userId)
+  })
+})
+
+httpServer.listen(PORT, async () => {
   console.log(`\n🚀 Meshenger сервер: http://localhost:${PORT}`)
   // Тест — отправляем тебе уведомление о запуске
   const ok = await tgSend(ADMIN_CHAT_ID, '🚀 <b>Meshenger сервер запущен!</b>\n\nВсе коды регистрации будут приходить сюда.')
   console.log(`   Telegram: ${ok ? '✅ подключён' : '❌ ошибка'}`)
+  console.log(`   WebSocket: ✅ включен`)
   console.log(`   Защита: rate limiting + brute-force + session tokens`)
   console.log(`   iOS ссылка: ${IOS_DOWNLOAD_URL}`)
 
