@@ -516,22 +516,53 @@ io.on('connection', (socket) => {
   console.log(`✅ Пользователь подключен: ${socket.phone} (${socket.id})`)
   userSockets.set(socket.userId, socket.id)
 
+  // Уведомляем всех что пользователь онлайн
+  socket.broadcast.emit('user:online', { userId: socket.userId })
+
   // Отправить сообщение
   socket.on('message:send', (data) => {
-    const { chatId, message } = data
+    const { chatId, message, recipientId } = data
     console.log(`💬 Сообщение от ${socket.phone}: ${message}`)
     
     // Сохраняем в БД
     db.saveMessage(chatId, socket.userId, message)
     
-    // Отправляем всем в чате
-    io.to(chatId).emit('message:receive', {
+    // Отправляем отправителю подтверждение
+    socket.emit('message:receive', {
       chatId,
       userId: socket.userId,
       phone: socket.phone,
       message,
       timestamp: new Date(),
+      status: 'sent',
     })
+
+    // Отправляем получателю если онлайн
+    if (recipientId) {
+      const recipientSocketId = userSockets.get(recipientId)
+      if (recipientSocketId) {
+        io.to(recipientSocketId).emit('message:receive', {
+          chatId,
+          userId: socket.userId,
+          phone: socket.phone,
+          message,
+          timestamp: new Date(),
+          status: 'delivered',
+        })
+        // Уведомляем отправителя о доставке
+        socket.emit('message:delivered', { chatId, userId: socket.userId })
+      }
+    } else {
+      // Групповой чат — отправляем всем в комнате кроме отправителя
+      socket.to(chatId).emit('message:receive', {
+        chatId,
+        userId: socket.userId,
+        phone: socket.phone,
+        message,
+        timestamp: new Date(),
+        status: 'delivered',
+      })
+    }
   })
 
   // Присоединиться к чату
@@ -595,6 +626,8 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`❌ Пользователь отключен: ${socket.phone}`)
     userSockets.delete(socket.userId)
+    // Уведомляем всех что пользователь офлайн
+    socket.broadcast.emit('user:offline', { userId: socket.userId })
   })
 })
 

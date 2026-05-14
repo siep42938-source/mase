@@ -10,6 +10,7 @@ import { Avatar } from '../ui/Avatar'
 import { MessageStatus } from '../ui/MessageStatus'
 import { NetworkBadge } from '../ui/NetworkBadge'
 import { formatTime, formatChatDate } from '../../utils/format'
+import { socketService } from '../../services/socketService'
 import type { Chat, Message } from '../../types'
 import clsx from 'clsx'
 
@@ -69,7 +70,16 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ chatId, onBack }) => {
   const handleSend = () => {
     const trimmed = text.trim()
     if (!trimmed || isReadOnly) return
+
+    // Добавляем локально
     sendMessage(chatId, trimmed, currentUser?.id ?? 'me')
+
+    // Отправляем через WebSocket если подключены
+    if (socketService.isConnected()) {
+      const otherId = chat.participants.find(p => p !== 'me' && p !== currentUser?.id)
+      socketService.sendMessage(chatId, trimmed, otherId || '')
+    }
+
     setText('')
     inputRef.current?.focus()
   }
